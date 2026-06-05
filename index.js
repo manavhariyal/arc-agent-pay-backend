@@ -213,6 +213,43 @@ app.get("/api/circle-wallets", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3001;
+// One-time setup: Create Circle wallet set and wallet
+app.post("/api/setup-circle-wallet", async (req, res) => {
+  try {
+    const client = getCircleClient();
+    
+    // Create wallet set
+    const walletSetResponse = await client.createWalletSet({
+      name: "Arc Agent Pay Wallet Set",
+    });
+    const walletSetId = walletSetResponse.data?.walletSet?.id;
+    if (!walletSetId) throw new Error("Wallet set creation failed");
+
+    // Create wallet on Arc Testnet
+    const walletResponse = await client.createWallets({
+      walletSetId,
+      blockchains: ["ARC-TESTNET"],
+      count: 1,
+      accountType: "EOA",
+    });
+
+    const wallet = walletResponse.data?.wallets?.[0];
+    if (!wallet) throw new Error("Wallet creation failed");
+
+    console.log("✅ Circle Wallet Created:", wallet);
+
+    res.json({
+      success: true,
+      walletSetId,
+      walletId: wallet.id,
+      walletAddress: wallet.address,
+      message: "Save these IDs! You need walletId for payment rules."
+    });
+  } catch (err) {
+    console.error("Setup error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 app.listen(PORT, () => {
   console.log(`\n🚀 Arc Agent Pay Backend running on port ${PORT}`);
   console.log(`📡 Arc Testnet (Chain ID: 5042002)`);
