@@ -5,6 +5,7 @@ const cron = require("node-cron");
 const { createClient } = require("@supabase/supabase-js");
 const {
   initiateDeveloperControlledWalletsClient,
+  generateEntitySecretCiphertext,
 } = require("@circle-fin/developer-controlled-wallets");
 
 const app = express();
@@ -24,6 +25,7 @@ function getCircleClient() {
 }
 
 const ARC_TESTNET_USDC = "0x3600000000000000000000000000000000000000";
+const PORT = process.env.PORT || 3001;
 
 async function executeRule(rule) {
   console.log(`\n[SCHEDULER] Executing rule: ${rule.id}`);
@@ -120,6 +122,19 @@ cron.schedule("*/5 * * * *", checkAndRunDueRules);
 
 app.get("/health", (req, res) => res.json({ status: "ok", timestamp: new Date().toISOString(), network: "Arc Testnet" }));
 
+// Generate ciphertext for Circle entity secret registration
+app.get("/api/generate-ciphertext", async (req, res) => {
+  try {
+    const ciphertext = await generateEntitySecretCiphertext(
+      process.env.CIRCLE_API_KEY,
+      process.env.CIRCLE_ENTITY_SECRET
+    );
+    res.json({ ciphertext });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/api/agents", async (req, res) => {
   const { data, error } = await supabase.from("agents").select("*").order("created_at", { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
@@ -212,32 +227,20 @@ app.get("/api/circle-wallets", async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 3001;
-// One-time setup: Create Circle wallet set and wallet
 app.post("/api/setup-circle-wallet", async (req, res) => {
   try {
     const client = getCircleClient();
-    
-    // Create wallet set
-    const walletSetResponse = await client.createWalletSet({
-      name: "Arc Agent Pay Wallet Set",
-    });
+    const walletSetResponse = await client.createWalletSet({ name: "Arc Agent Pay Wallet Set" });
     const walletSetId = walletSetResponse.data?.walletSet?.id;
     if (!walletSetId) throw new Error("Wallet set creation failed");
-
-    // Create wallet on Arc Testnet
     const walletResponse = await client.createWallets({
       walletSetId,
       blockchains: ["ARC-TESTNET"],
       count: 1,
       accountType: "EOA",
     });
-
     const wallet = walletResponse.data?.wallets?.[0];
     if (!wallet) throw new Error("Wallet creation failed");
-
-    console.log("✅ Circle Wallet Created:", wallet);
-
     res.json({
       success: true,
       walletSetId,
@@ -246,10 +249,10 @@ app.post("/api/setup-circle-wallet", async (req, res) => {
       message: "Save these IDs! You need walletId for payment rules."
     });
   } catch (err) {
-    console.error("Setup error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
+
 app.listen(PORT, () => {
   console.log(`\n🚀 Arc Agent Pay Backend running on port ${PORT}`);
   console.log(`📡 Arc Testnet (Chain ID: 5042002)`);
