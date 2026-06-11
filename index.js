@@ -35,6 +35,17 @@ async function executeRule(rule) {
     if (agent.status !== "active") { console.log(`[SKIP] Agent not active`); return; }
     if (!rule.circle_wallet_id) { await logTransaction(rule, agent, "failed", "No Circle wallet linked"); return; }
 
+    // Check user balance before sending
+    const userWallet = agent.wallet_address?.toLowerCase();
+    if (userWallet) {
+      const { data: bal } = await supabase.from("user_balances").select("*").eq("wallet_address", userWallet).single();
+      if (bal && parseFloat(bal.balance) < parseFloat(rule.amount)) {
+        console.log(`[SKIP] Insufficient balance for ${userWallet}`);
+        await logTransaction(rule, agent, "failed", "Insufficient user balance. Please deposit more USDC.");
+        return;
+      }
+    }
+
     const client = getCircleClient();
     console.log(`[TX] Sending ${rule.amount} USDC to ${rule.recipient_address}`);
 
@@ -65,6 +76,24 @@ async function executeRule(rule) {
 
     if (state === "COMPLETE") {
       await logTransaction(rule, agent, "success", null, txHash);
+
+      // Deduct from user balance
+      try {
+        if (userWallet) {
+          const { data: bal } = await supabase.from("user_balances").select("*").eq("wallet_address", userWallet).single();
+          if (bal) {
+            await supabase.from("user_balances").update({
+              balance: Math.max(0, parseFloat(bal.balance) - parseFloat(rule.amount)),
+              total_spent: parseFloat(bal.total_spent) + parseFloat(rule.amount),
+              updated_at: new Date().toISOString(),
+            }).eq("wallet_address", userWallet);
+            console.log(`[BALANCE] Deducted ${rule.amount} USDC from ${userWallet}`);
+          }
+        }
+      } catch (e) {
+        console.error("[BALANCE ERROR]", e.message);
+      }
+
       await supabase.from("payment_rules").update({
         last_executed_at: new Date().toISOString(),
         execution_count: (rule.execution_count || 0) + 1,
@@ -122,13 +151,9 @@ cron.schedule("*/5 * * * *", checkAndRunDueRules);
 
 app.get("/health", (req, res) => res.json({ status: "ok", timestamp: new Date().toISOString(), network: "Arc Testnet" }));
 
-// Generate ciphertext for Circle entity secret registration
 app.get("/api/generate-ciphertext", async (req, res) => {
   try {
-    const ciphertext = await generateEntitySecretCiphertext(
-      process.env.CIRCLE_API_KEY,
-      process.env.CIRCLE_ENTITY_SECRET
-    );
+    const ciphertext = await generateEntitySecretCiphertext(process.env.CIRCLE_API_KEY, process.env.CIRCLE_ENTITY_SECRET);
     res.json({ ciphertext });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -234,20 +259,64 @@ app.post("/api/setup-circle-wallet", async (req, res) => {
     const walletSetId = walletSetResponse.data?.walletSet?.id;
     if (!walletSetId) throw new Error("Wallet set creation failed");
     const walletResponse = await client.createWallets({
-      walletSetId,
-      blockchains: ["ARC-TESTNET"],
-      count: 1,
-      accountType: "EOA",
+      walletSetId, blockchains: ["ARC-TESTNET"], count: 1, accountType: "EOA",
     });
     const wallet = walletResponse.data?.wallets?.[0];
     if (!wallet) throw new Error("Wallet creation failed");
-    res.json({
-      success: true,
-      walletSetId,
-      walletId: wallet.id,
-      walletAddress: wallet.address,
-      message: "Save these IDs! You need walletId for payment rules."
+    res.json({ success: true, walletSetId, walletId: wallet.id, walletAddress: wallet.address });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Balance & Deposit Routes ──────────────────────────────────────
+
+app.get("/api/balance/user/:address", async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("user_balances").select("*").eq("wallet_address", req.params.address.toLowerCase()).single();
+    if (error || !data) return res.json({ wallet_address: req.params.address, balance: 0, total_deposited: 0, total_spent: 0 });
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/deposit", async (req, res) => {
+  try {
+    const { wallet_address, amount, tx_hash } = req.body;
+    if (!wallet_address || !amount) return res.status(400).json({ error: "Missing fields" });
+    const address = wallet_address.toLowerCase();
+
+    await supabase.from("deposits").insert({
+      wallet_address: address, amount: parseFloat(amount),
+      tx_hash, status: "confirmed", created_at: new Date().toISOString(),
     });
+
+    const { data: existing } = await supabase.from("user_balances").select("*").eq("wallet_address", address).single();
+    if (existing) {
+      await supabase.from("user_balances").update({
+        balance: parseFloat(existing.balance) + parseFloat(amount),
+        total_deposited: parseFloat(existing.total_deposited) + parseFloat(amount),
+        updated_at: new Date().toISOString(),
+      }).eq("wallet_address", address);
+    } else {
+      await supabase.from("user_balances").insert({
+        wallet_address: address, balance: parseFloat(amount),
+        total_deposited: parseFloat(amount), total_spent: 0,
+        created_at: new Date().toISOString(),
+      });
+    }
+    res.json({ success: true, message: `Deposited ${amount} USDC` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/deposits/:address", async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("deposits").select("*").eq("wallet_address", req.params.address.toLowerCase()).order("created_at", { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
