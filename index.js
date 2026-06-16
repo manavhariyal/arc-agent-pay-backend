@@ -31,18 +31,36 @@ async function executeRule(rule) {
   console.log(`\n[SCHEDULER] Executing rule: ${rule.id}`);
   try {
     const { data: agent } = await supabase.from("agents").select("*").eq("id", rule.agent_id).single();
-    if (!agent) { await logTransaction(rule, null, "failed", "Agent not found"); return; }
+    if (!agent) { console.log(`[SKIP] Agent not found`); return; }
     if (agent.status !== "active") { console.log(`[SKIP] Agent not active`); return; }
-    if (!rule.circle_wallet_id) { await logTransaction(rule, agent, "failed", "No Circle wallet linked"); return; }
+    if (!rule.circle_wallet_id) { console.log(`[SKIP] No Circle wallet linked`); return; }
 
     // Check user balance before sending
     const userWallet = agent.wallet_address?.toLowerCase();
     if (userWallet) {
-      const { data: bal } = await supabase.from("user_balances").select("*").eq("wallet_address", userWallet).single();
-      if (bal && parseFloat(bal.balance) < parseFloat(rule.amount)) {
-        console.log(`[SKIP] Insufficient balance for ${userWallet}`);
-        await logTransaction(rule, agent, "failed", "Insufficient user balance. Please deposit more USDC.");
-        return;
+      const { data: bal } = await supabase
+        .from("user_balances")
+        .select("*")
+        .eq("wallet_address", userWallet)
+        .single();
+
+      if (!bal || parseFloat(bal.balance) < parseFloat(rule.amount)) {
+        console.log(`[BALANCE] Insufficient balance for ${userWallet} - auto pausing agent`);
+
+        // Auto pause the agent
+        await supabase
+          .from("agents")
+          .update({ status: "paused" })
+          .eq("id", agent.id);
+
+        // Auto pause all rules for this agent
+        await supabase
+          .from("payment_rules")
+          .update({ is_active: false, status: "paused" })
+          .eq("agent_id", agent.id);
+
+        console.log(`[AUTO-PAUSE] Agent "${agent.name}" paused - balance insufficient`);
+        return; // No failed transaction logged!
       }
     }
 
@@ -77,17 +95,22 @@ async function executeRule(rule) {
     if (state === "COMPLETE") {
       await logTransaction(rule, agent, "success", null, txHash);
 
-      // Deduct from user balance
+      // Deduct from user balance only on success
       try {
         if (userWallet) {
-          const { data: bal } = await supabase.from("user_balances").select("*").eq("wallet_address", userWallet).single();
+          const { data: bal } = await supabase
+            .from("user_balances")
+            .select("*")
+            .eq("wallet_address", userWallet)
+            .single();
           if (bal) {
+            const newBalance = Math.max(0, parseFloat(bal.balance) - parseFloat(rule.amount));
             await supabase.from("user_balances").update({
-              balance: Math.max(0, parseFloat(bal.balance) - parseFloat(rule.amount)),
+              balance: newBalance,
               total_spent: parseFloat(bal.total_spent) + parseFloat(rule.amount),
               updated_at: new Date().toISOString(),
             }).eq("wallet_address", userWallet);
-            console.log(`[BALANCE] Deducted ${rule.amount} USDC from ${userWallet}`);
+            console.log(`[BALANCE] Deducted ${rule.amount} USDC. New balance: ${newBalance}`);
           }
         }
       } catch (e) {
@@ -100,7 +123,7 @@ async function executeRule(rule) {
       }).eq("id", rule.id);
       console.log(`[SUCCESS] TX: ${txHash}`);
     } else {
-      await logTransaction(rule, agent, "failed", `State: ${state}`);
+      await logTransaction(rule, agent, "failed", `Transaction state: ${state}`);
     }
   } catch (err) {
     console.error(`[ERROR]`, err.message);
@@ -136,7 +159,11 @@ function isRuleDue(rule, now) {
 async function checkAndRunDueRules() {
   console.log(`\n[CRON] Checking at ${new Date().toISOString()}`);
   try {
-    const { data: rules } = await supabase.from("payment_rules").select("*").eq("is_active", true).eq("status", "active");
+    const { data: rules } = await supabase
+      .from("payment_rules")
+      .select("*")
+      .eq("is_active", true)
+      .eq("status", "active");
     if (!rules || rules.length === 0) { console.log("[CRON] No active rules."); return; }
     const now = new Date();
     for (const rule of rules) {
@@ -268,8 +295,6 @@ app.post("/api/setup-circle-wallet", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
-// ─── Balance & Deposit Routes ──────────────────────────────────────
 
 app.get("/api/balance/user/:address", async (req, res) => {
   try {
