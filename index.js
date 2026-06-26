@@ -27,6 +27,10 @@ function getCircleClient() {
 const ARC_TESTNET_USDC = "0x3600000000000000000000000000000000000000";
 const PORT = process.env.PORT || 3001;
 
+function normalizeAddress(addr) {
+  return addr ? String(addr).toLowerCase() : null;
+}
+
 async function executeRule(rule) {
   console.log(`\n[SCHEDULER] Executing rule: ${rule.id}`);
   try {
@@ -35,8 +39,7 @@ async function executeRule(rule) {
     if (agent.status !== "active") { console.log(`[SKIP] Agent not active`); return; }
     if (!rule.circle_wallet_id) { console.log(`[SKIP] No Circle wallet linked`); return; }
 
-    // Check user balance before sending
-    const userWallet = agent.wallet_address?.toLowerCase();
+    const userWallet = normalizeAddress(agent.owner_address || agent.wallet_address);
     if (userWallet) {
       const { data: bal } = await supabase
         .from("user_balances")
@@ -46,21 +49,10 @@ async function executeRule(rule) {
 
       if (!bal || parseFloat(bal.balance) < parseFloat(rule.amount)) {
         console.log(`[BALANCE] Insufficient balance for ${userWallet} - auto pausing agent`);
-
-        // Auto pause the agent
-        await supabase
-          .from("agents")
-          .update({ status: "paused" })
-          .eq("id", agent.id);
-
-        // Auto pause all rules for this agent
-        await supabase
-          .from("payment_rules")
-          .update({ is_active: false, status: "paused" })
-          .eq("agent_id", agent.id);
-
+        await supabase.from("agents").update({ status: "paused" }).eq("id", agent.id);
+        await supabase.from("payment_rules").update({ is_active: false, status: "paused" }).eq("agent_id", agent.id);
         console.log(`[AUTO-PAUSE] Agent "${agent.name}" paused - balance insufficient`);
-        return; // No failed transaction logged!
+        return;
       }
     }
 
@@ -95,14 +87,9 @@ async function executeRule(rule) {
     if (state === "COMPLETE") {
       await logTransaction(rule, agent, "success", null, txHash);
 
-      // Deduct from user balance only on success
       try {
         if (userWallet) {
-          const { data: bal } = await supabase
-            .from("user_balances")
-            .select("*")
-            .eq("wallet_address", userWallet)
-            .single();
+          const { data: bal } = await supabase.from("user_balances").select("*").eq("wallet_address", userWallet).single();
           if (bal) {
             const newBalance = Math.max(0, parseFloat(bal.balance) - parseFloat(rule.amount));
             await supabase.from("user_balances").update({
@@ -159,11 +146,7 @@ function isRuleDue(rule, now) {
 async function checkAndRunDueRules() {
   console.log(`\n[CRON] Checking at ${new Date().toISOString()}`);
   try {
-    const { data: rules } = await supabase
-      .from("payment_rules")
-      .select("*")
-      .eq("is_active", true)
-      .eq("status", "active");
+    const { data: rules } = await supabase.from("payment_rules").select("*").eq("is_active", true).eq("status", "active");
     if (!rules || rules.length === 0) { console.log("[CRON] No active rules."); return; }
     const now = new Date();
     for (const rule of rules) {
@@ -187,18 +170,29 @@ app.get("/api/generate-ciphertext", async (req, res) => {
   }
 });
 
+// ───────── AGENTS (owner-filtered) ─────────
+
 app.get("/api/agents", async (req, res) => {
-  const { data, error } = await supabase.from("agents").select("*").order("created_at", { ascending: false });
+  const owner = normalizeAddress(req.query.owner);
+  if (!owner) return res.json([]); // no owner = no data, never return everyone's agents
+  const { data, error } = await supabase
+    .from("agents")
+    .select("*")
+    .eq("owner_address", owner)
+    .order("created_at", { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
 
 app.post("/api/agents", async (req, res) => {
-  const { name, description, wallet_address, alert_threshold, status } = req.body;
+  const { name, description, wallet_address, alert_threshold, status, owner_address } = req.body;
+  const owner = normalizeAddress(owner_address);
+  if (!owner) return res.status(400).json({ error: "owner_address is required" });
   const { data, error } = await supabase.from("agents").insert({
     name, description, wallet_address,
     alert_threshold: alert_threshold || 10,
     status: status || "active",
+    owner_address: owner,
     created_at: new Date().toISOString(),
   }).select().single();
   if (error) return res.status(500).json({ error: error.message });
@@ -206,20 +200,33 @@ app.post("/api/agents", async (req, res) => {
 });
 
 app.put("/api/agents/:id", async (req, res) => {
-  const { data, error } = await supabase.from("agents").update(req.body).eq("id", req.params.id).select().single();
+  const owner = normalizeAddress(req.query.owner || req.body.owner_address);
+  if (!owner) return res.status(400).json({ error: "owner is required" });
+  const { data: existing } = await supabase.from("agents").select("owner_address").eq("id", req.params.id).single();
+  if (!existing || existing.owner_address !== owner) return res.status(403).json({ error: "Not authorized to edit this agent" });
+  const { owner_address, ...updateBody } = req.body;
+  const { data, error } = await supabase.from("agents").update(updateBody).eq("id", req.params.id).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
 
 app.delete("/api/agents/:id", async (req, res) => {
+  const owner = normalizeAddress(req.query.owner);
+  if (!owner) return res.status(400).json({ error: "owner is required" });
+  const { data: existing } = await supabase.from("agents").select("owner_address").eq("id", req.params.id).single();
+  if (!existing || existing.owner_address !== owner) return res.status(403).json({ error: "Not authorized to delete this agent" });
   const { error } = await supabase.from("agents").delete().eq("id", req.params.id);
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
 
+// ───────── RULES (owner-filtered) ─────────
+
 app.get("/api/rules", async (req, res) => {
+  const owner = normalizeAddress(req.query.owner);
   const { agent_id } = req.query;
-  let query = supabase.from("payment_rules").select("*, agents(name, wallet_address)").order("created_at", { ascending: false });
+  if (!owner) return res.json([]);
+  let query = supabase.from("payment_rules").select("*, agents(name, wallet_address)").eq("owner_address", owner).order("created_at", { ascending: false });
   if (agent_id) query = query.eq("agent_id", agent_id);
   const { data, error } = await query;
   if (error) return res.status(500).json({ error: error.message });
@@ -227,10 +234,18 @@ app.get("/api/rules", async (req, res) => {
 });
 
 app.post("/api/rules", async (req, res) => {
-  const { agent_id, name, amount, interval, recipient_address, circle_wallet_id } = req.body;
+  const { agent_id, name, amount, interval, recipient_address, circle_wallet_id, owner_address } = req.body;
+  const owner = normalizeAddress(owner_address);
+  if (!owner) return res.status(400).json({ error: "owner_address is required" });
+
+  // Verify the agent actually belongs to this owner
+  const { data: agent } = await supabase.from("agents").select("owner_address").eq("id", agent_id).single();
+  if (!agent || agent.owner_address !== owner) return res.status(403).json({ error: "Not authorized to create rules for this agent" });
+
   const { data, error } = await supabase.from("payment_rules").insert({
     agent_id, name, amount, interval, recipient_address,
     circle_wallet_id: circle_wallet_id || null,
+    owner_address: owner,
     is_active: true, status: "active", execution_count: 0,
     created_at: new Date().toISOString(),
   }).select().single();
@@ -239,7 +254,10 @@ app.post("/api/rules", async (req, res) => {
 });
 
 app.patch("/api/rules/:id/toggle", async (req, res) => {
-  const { data: rule } = await supabase.from("payment_rules").select("is_active").eq("id", req.params.id).single();
+  const owner = normalizeAddress(req.query.owner);
+  if (!owner) return res.status(400).json({ error: "owner is required" });
+  const { data: rule } = await supabase.from("payment_rules").select("is_active, owner_address").eq("id", req.params.id).single();
+  if (!rule || rule.owner_address !== owner) return res.status(403).json({ error: "Not authorized" });
   const { data, error } = await supabase.from("payment_rules")
     .update({ is_active: !rule.is_active, status: !rule.is_active ? "active" : "paused" })
     .eq("id", req.params.id).select().single();
@@ -248,21 +266,36 @@ app.patch("/api/rules/:id/toggle", async (req, res) => {
 });
 
 app.delete("/api/rules/:id", async (req, res) => {
+  const owner = normalizeAddress(req.query.owner);
+  if (!owner) return res.status(400).json({ error: "owner is required" });
+  const { data: rule } = await supabase.from("payment_rules").select("owner_address").eq("id", req.params.id).single();
+  if (!rule || rule.owner_address !== owner) return res.status(403).json({ error: "Not authorized" });
   const { error } = await supabase.from("payment_rules").delete().eq("id", req.params.id);
   if (error) return res.status(500).json({ error: error.message });
   res.json({ success: true });
 });
 
 app.post("/api/rules/:id/execute", async (req, res) => {
+  const owner = normalizeAddress(req.query.owner);
   const { data: rule, error } = await supabase.from("payment_rules").select("*").eq("id", req.params.id).single();
   if (error || !rule) return res.status(404).json({ error: "Rule not found" });
+  if (owner && rule.owner_address !== owner) return res.status(403).json({ error: "Not authorized" });
   executeRule(rule);
   res.json({ success: true, message: "Payment execution triggered!" });
 });
 
+// ───────── TRANSACTIONS (owner-filtered via agent ownership) ─────────
+
 app.get("/api/transactions", async (req, res) => {
+  const owner = normalizeAddress(req.query.owner);
   const { agent_id, limit = 50 } = req.query;
-  let query = supabase.from("transactions").select("*, agents(name)").order("created_at", { ascending: false }).limit(limit);
+  if (!owner) return res.json([]);
+
+  const { data: ownedAgents } = await supabase.from("agents").select("id").eq("owner_address", owner);
+  const ownedIds = (ownedAgents || []).map(a => a.id);
+  if (ownedIds.length === 0) return res.json([]);
+
+  let query = supabase.from("transactions").select("*, agents(name)").in("agent_id", ownedIds).order("created_at", { ascending: false }).limit(limit);
   if (agent_id) query = query.eq("agent_id", agent_id);
   const { data, error } = await query;
   if (error) return res.status(500).json({ error: error.message });
@@ -296,9 +329,11 @@ app.post("/api/setup-circle-wallet", async (req, res) => {
   }
 });
 
+// ───────── Balance & Deposit (already per-wallet) ─────────
+
 app.get("/api/balance/user/:address", async (req, res) => {
   try {
-    const { data, error } = await supabase.from("user_balances").select("*").eq("wallet_address", req.params.address.toLowerCase()).single();
+    const { data, error } = await supabase.from("user_balances").select("*").eq("wallet_address", normalizeAddress(req.params.address)).single();
     if (error || !data) return res.json({ wallet_address: req.params.address, balance: 0, total_deposited: 0, total_spent: 0 });
     res.json(data);
   } catch (err) {
@@ -310,7 +345,7 @@ app.post("/api/deposit", async (req, res) => {
   try {
     const { wallet_address, amount, tx_hash } = req.body;
     if (!wallet_address || !amount) return res.status(400).json({ error: "Missing fields" });
-    const address = wallet_address.toLowerCase();
+    const address = normalizeAddress(wallet_address);
 
     await supabase.from("deposits").insert({
       wallet_address: address, amount: parseFloat(amount),
@@ -339,7 +374,7 @@ app.post("/api/deposit", async (req, res) => {
 
 app.get("/api/deposits/:address", async (req, res) => {
   try {
-    const { data, error } = await supabase.from("deposits").select("*").eq("wallet_address", req.params.address.toLowerCase()).order("created_at", { ascending: false });
+    const { data, error } = await supabase.from("deposits").select("*").eq("wallet_address", normalizeAddress(req.params.address)).order("created_at", { ascending: false });
     if (error) return res.status(500).json({ error: error.message });
     res.json(data);
   } catch (err) {
