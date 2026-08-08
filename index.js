@@ -7,6 +7,7 @@ const {
   initiateDeveloperControlledWalletsClient,
   generateEntitySecretCiphertext,
 } = require("@circle-fin/developer-controlled-wallets");
+const { createGatewayMiddleware } = require("@circle-fin/x402-batching/server");
 
 const app = express();
 app.use(cors({ origin: "*" }));
@@ -26,6 +27,14 @@ function getCircleClient() {
 
 const ARC_TESTNET_USDC = "0x3600000000000000000000000000000000000000";
 const PORT = process.env.PORT || 3001;
+
+// --- x402 demo (seller side) ---
+const X402_SELLER_WALLET = process.env.X402_SELLER_WALLET || "0x48f40e29eb0aef155c3dac794d7a34d95bddc918";
+const x402Gateway = createGatewayMiddleware({
+  sellerAddress: X402_SELLER_WALLET,
+  facilitatorUrl: "https://gateway-api-testnet.circle.com",
+  networks: ["eip155:5042002"], // Arc Testnet
+});
 
 function normalizeAddress(addr) {
   return addr ? String(addr).toLowerCase() : null;
@@ -160,6 +169,24 @@ async function checkAndRunDueRules() {
 cron.schedule("*/5 * * * *", checkAndRunDueRules);
 
 app.get("/health", (req, res) => res.json({ status: "ok", timestamp: new Date().toISOString(), network: "Arc Testnet" }));
+
+// x402 demo: paid endpoint. Returns a live-looking gold price for $0.001 USDC.
+// Unpaid requests automatically get a 402 Payment Required response from the gateway middleware.
+app.post("/api/x402-demo/gold-price", x402Gateway.require("$0.001"), (req, res) => {
+  const payment = req.payment;
+  const price = (2600 + Math.random() * 40).toFixed(2);
+  res.json({
+    metal: "gold",
+    price_usd_per_oz: price,
+    timestamp: new Date().toISOString(),
+    paid: {
+      amount: payment?.amount ? `${payment.amount} (raw units)` : "$0.001",
+      payer: payment?.payer,
+      network: payment?.network,
+      transaction: payment?.transaction,
+    },
+  });
+});
 
 app.get("/api/generate-ciphertext", async (req, res) => {
   try {
