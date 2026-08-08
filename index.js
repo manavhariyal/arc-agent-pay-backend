@@ -188,6 +188,44 @@ app.post("/api/x402-demo/gold-price", x402Gateway.require("$0.001"), (req, res) 
   });
 });
 
+function getX402BuyerClient() {
+  const { GatewayClient } = require("@circle-fin/x402-batching/client");
+  return new GatewayClient({
+    chain: "arcTestnet",
+    privateKey: process.env.X402_BUYER_PRIVATE_KEY,
+  });
+}
+
+// One-time setup: moves USDC from the buyer wallet's regular balance into its
+// Gateway balance. Must be called once (with funds already in the wallet)
+// before /fetch-gold-price will work. Safe to call again to top up later.
+app.post("/api/x402-demo/setup-buyer", async (req, res) => {
+  try {
+    const amount = req.body?.amount || "1";
+    const gateway = getX402BuyerClient();
+    const result = await gateway.deposit(amount);
+    res.json({ success: true, buyerAddress: gateway.address, ...result });
+  } catch (err) {
+    console.error("[X402 SETUP ERROR]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// The actual demo: the buyer wallet automatically pays the paywalled
+// gold-price endpoint and returns the real data. This is the full
+// "agent hits a 402, pays, gets the resource" loop, fully automatic.
+app.post("/api/x402-demo/fetch-gold-price", async (req, res) => {
+  try {
+    const gateway = getX402BuyerClient();
+    const url = `${req.protocol}://${req.get("host")}/api/x402-demo/gold-price`;
+    const { data } = await gateway.pay(url, { method: "POST" });
+    res.json({ success: true, buyerAddress: gateway.address, data });
+  } catch (err) {
+    console.error("[X402 PAY ERROR]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/api/generate-ciphertext", async (req, res) => {
   try {
     const ciphertext = await generateEntitySecretCiphertext(process.env.CIRCLE_API_KEY, process.env.CIRCLE_ENTITY_SECRET);
