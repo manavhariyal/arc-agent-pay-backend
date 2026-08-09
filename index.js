@@ -239,8 +239,15 @@ app.post("/api/x402-demo/fetch-gold-price", async (req, res) => {
       transaction: result.transaction,
     });
   } catch (err) {
-    console.error("[X402 PAY ERROR]", err.message);
-    res.status(500).json({ error: err.message });
+    console.error("[X402 PAY ERROR]", err);
+    res.status(500).json({
+      error: err.message,
+      cause: err.cause ? String(err.cause) : undefined,
+      causeMessage: err.cause?.message,
+      responseData: err.response?.data,
+      details: err.details,
+      stack: err.stack?.split("\n").slice(0, 5),
+    });
   }
 });
 
