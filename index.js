@@ -1,4 +1,10 @@
 require("dotenv").config();
+
+// Fixes "Do not know how to serialize a BigInt" errors anywhere res.json() is used.
+BigInt.prototype.toJSON = function () {
+  return this.toString();
+};
+
 const express = require("express");
 const cors = require("cors");
 const cron = require("node-cron");
@@ -204,7 +210,12 @@ app.post("/api/x402-demo/setup-buyer", async (req, res) => {
     const amount = req.body?.amount || "1";
     const gateway = getX402BuyerClient();
     const result = await gateway.deposit(amount);
-    res.json({ success: true, buyerAddress: gateway.address, ...result });
+    res.json({
+      success: true,
+      buyerAddress: gateway.address,
+      ...result,
+      amount: result.amount?.toString(),
+    });
   } catch (err) {
     console.error("[X402 SETUP ERROR]", err.message);
     res.status(500).json({ error: err.message });
@@ -218,8 +229,15 @@ app.post("/api/x402-demo/fetch-gold-price", async (req, res) => {
   try {
     const gateway = getX402BuyerClient();
     const url = `${req.protocol}://${req.get("host")}/api/x402-demo/gold-price`;
-    const { data } = await gateway.pay(url, { method: "POST" });
-    res.json({ success: true, buyerAddress: gateway.address, data });
+    const result = await gateway.pay(url, { method: "POST" });
+    res.json({
+      success: true,
+      buyerAddress: gateway.address,
+      data: result.data,
+      amountPaid: result.amount?.toString(),
+      formattedAmount: result.formattedAmount,
+      transaction: result.transaction,
+    });
   } catch (err) {
     console.error("[X402 PAY ERROR]", err.message);
     res.status(500).json({ error: err.message });
