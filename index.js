@@ -183,16 +183,18 @@ async function fetchRealGoldPrice() {
     const res = await fetch("https://api.goldprice.dev/v1/prices?symbol=XAU-USD-SPOT", {
       signal: AbortSignal.timeout(5000),
     });
-    if (!res.ok) throw new Error(`Gold price API returned ${res.status}`);
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(`Gold price API returned ${res.status}: ${body.slice(0, 200)}`);
+    }
     const data = await res.json();
     const price = parseFloat(data.price);
-    if (!price || isNaN(price)) throw new Error("Invalid price in response");
+    if (!price || isNaN(price)) throw new Error("Invalid price in response: " + JSON.stringify(data).slice(0, 200));
     return { price: price.toFixed(2), source: "live", computed_at: data.computed_at };
   } catch (err) {
     console.error("[GOLD PRICE] Falling back to estimate:", err.message);
-    // Fallback so the demo never breaks if the external API is briefly down.
     const price = (2600 + Math.random() * 40).toFixed(2);
-    return { price, source: "estimate", computed_at: new Date().toISOString() };
+    return { price, source: "estimate", computed_at: new Date().toISOString(), debugError: err.message };
   }
 }
 
@@ -203,6 +205,7 @@ app.post("/api/x402-demo/gold-price", x402Gateway.require("$0.001"), async (req,
     metal: "gold",
     price_usd_per_oz: gold.price,
     price_source: gold.source, // "live" (real market data) or "estimate" (fallback)
+    debug_error: gold.debugError,
     price_computed_at: gold.computed_at,
     timestamp: new Date().toISOString(),
     paid: {
