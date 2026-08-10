@@ -243,6 +243,23 @@ app.post("/api/x402-demo/setup-buyer", async (req, res) => {
   }
 });
 
+// Check the buyer wallet's current Gateway balance, so the demo UI can show
+// remaining funds and warn before it runs out.
+app.get("/api/x402-demo/buyer-balance", async (req, res) => {
+  try {
+    const gateway = getX402BuyerClient();
+    const balances = await gateway.getBalances();
+    res.json({
+      buyerAddress: gateway.address,
+      gatewayAvailable: balances.gateway.formattedAvailable,
+      walletBalance: balances.wallet.formatted,
+    });
+  } catch (err) {
+    console.error("[X402 BALANCE ERROR]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // The actual demo: the buyer wallet automatically pays the paywalled
 // gold-price endpoint and returns the real data. This is the full
 // "agent hits a 402, pays, gets the resource" loop, fully automatic.
@@ -261,13 +278,14 @@ app.post("/api/x402-demo/fetch-gold-price", async (req, res) => {
     });
   } catch (err) {
     console.error("[X402 PAY ERROR]", err);
-    res.status(500).json({
-      error: err.message,
-      cause: err.cause ? String(err.cause) : undefined,
-      causeMessage: err.cause?.message,
-      responseData: err.response?.data,
-      details: err.details,
-      stack: err.stack?.split("\n").slice(0, 5),
+    const msg = (err.message || "").toLowerCase();
+    const isLowBalance = msg.includes("insufficient") || msg.includes("balance");
+    res.status(isLowBalance ? 402 : 500).json({
+      error: isLowBalance
+        ? "The demo buyer wallet is out of Gateway balance and needs a top-up."
+        : "Payment failed. Please try again in a moment.",
+      lowBalance: isLowBalance,
+      rawError: err.message,
     });
   }
 });
