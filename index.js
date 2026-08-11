@@ -274,7 +274,11 @@ app.post("/api/x402-demo/fetch-gold-price", async (req, res) => {
       data: result.data,
       amountPaid: result.amount?.toString(),
       formattedAmount: result.formattedAmount,
-      transaction: result.transaction,
+      // This is Circle's internal transfer ID, NOT an onchain tx hash.
+      // Gateway batches many payments together and settles them onchain
+      // periodically, so the real hash isn't known yet at this point.
+      // Use GET /api/x402-demo/settlement/:transferId to check for it.
+      transferId: result.transaction,
     });
   } catch (err) {
     console.error("[X402 PAY ERROR]", err);
@@ -287,6 +291,30 @@ app.post("/api/x402-demo/fetch-gold-price", async (req, res) => {
       lowBalance: isLowBalance,
       rawError: err.message,
     });
+  }
+});
+
+// Checks whether a x402 payment has settled onchain yet, and returns the
+// real transaction hash once Gateway's batch actually executes. Multiple
+// payments settled in the same batch will share the same hash — that's
+// expected, it's how Gateway keeps micropayments cheap.
+app.get("/api/x402-demo/settlement/:transferId", async (req, res) => {
+  try {
+    const r = await fetch(
+      `https://gateway-api-testnet.circle.com/v1/x402/transfers/${req.params.transferId}`,
+      { signal: AbortSignal.timeout(8000) }
+    );
+    if (!r.ok) throw new Error(`Gateway returned ${r.status}`);
+    const transfer = await r.json();
+    res.json({
+      status: transfer.status,
+      txHash: transfer.txHash || null,
+      settled: !!transfer.txHash,
+      explorerUrl: transfer.txHash ? `https://testnet.arcscan.app/tx/${transfer.txHash}` : null,
+    });
+  } catch (err) {
+    console.error("[X402 SETTLEMENT CHECK ERROR]", err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
